@@ -107,11 +107,17 @@ async def upload_body_photo(session_id: str, file: UploadFile) -> tuple[str, str
 
 
 def get_signed_url(bucket: str, path: str, ttl: int = SIGNED_URL_TTL_SECONDS) -> str:
-    """Generate a short-lived signed URL for a stored object."""
+    """Generate a short-lived signed URL for a stored object.
+
+    Supabase Python SDK v2 returns the key as 'signedUrl' (lowercase 'r').
+    We check both spellings so the code survives a future SDK version bump.
+    """
     result = get_supabase().storage.from_(bucket).create_signed_url(path, ttl)
-    if "signedURL" not in result:
+    # SDK v2 → 'signedUrl'; SDK v1 / some builds → 'signedURL'
+    url = result.get("signedUrl") or result.get("signedURL")
+    if not url:
         raise RuntimeError(f"Failed to generate signed URL for {path}: {result}")
-    return result["signedURL"]
+    return url
 
 
 async def download_body_photo(session_id: str, body_photo_path: str) -> bytes:

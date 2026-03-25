@@ -197,6 +197,10 @@ def _require_session_row(request: Request) -> dict:
 # ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
 
+@app.get("/")
+def root():
+    return {"message": "Aina backend is live!"}
+
 @app.get("/health")
 async def health():
     """Liveness probe."""
@@ -235,6 +239,8 @@ async def create_session(
             })
             updated = session_svc.get_session(existing_sid)
             _set_session_cookie(response, existing_sid)
+            # 200 OK — this is an update, not a creation
+            response.status_code = 200
             return updated
 
     session = session_svc.create_session(body)
@@ -463,19 +469,69 @@ async def generate_avatar(
             "message":    "Please complete measurement extraction before generating your avatar.",
         })
 
+    # ── Guard: stale-generating recovery ─────────────────────────────────────
+    # This MUST come before the body-photo guard.
+    #
+    # Scenario that causes the bug without this block:
+    #   1. Client calls POST /session/avatar — backend sets avatar_status=generating
+    #   2. Client times out or aborts after 90s
+    #   3. Backend Vertex call finishes (success or failure) and updates the DB
+    #      OR the backend process itself crashed, leaving status permanently stuck
+    #   4. Client retries — hits the body-photo guard (which comes next) BEFORE
+    #      the generating guard, so it gets 422 "Body photo missing" when the
+    #      real problem is a stale generating state, not a missing photo
+    #
+    # Fix: check for generating FIRST. If it has been generating for >120s
+    # (well past the Vertex 90s ceiling), treat it as a stale lock and reset
+    # to failed so the retry can proceed cleanly.
+    #
+    # If it's been generating for <120s the previous request is still legitimately
+    # in-flight — return 409 so the client knows to wait and poll.
+    if session_row.get("avatar_status") == AvatarStatus.generating.value:
+        STALE_GENERATING_SECONDS = 120
+        updated_at_raw = session_row.get("updated_at")
+        is_stale = False
+        if updated_at_raw:
+            from datetime import datetime, timezone as _tz
+            try:
+                if isinstance(updated_at_raw, str):
+                    updated_at = datetime.fromisoformat(updated_at_raw.replace("Z", "+00:00"))
+                else:
+                    updated_at = updated_at_raw
+                age_seconds = (datetime.now(_tz.utc) - updated_at).total_seconds()
+                is_stale = age_seconds > STALE_GENERATING_SECONDS
+            except Exception:
+                is_stale = False  # be conservative — don't reset if we can't parse
+
+        if is_stale:
+            log.warning(
+                f"[{session_id}] Stale generating lock detected "
+                f"(updated_at={updated_at_raw}) — resetting to failed so retry can proceed"
+            )
+            session_svc.set_avatar_failed(
+                session_id,
+                error_code = "STALE_GENERATING_RESET",
+                message    = "Previous generation attempt timed out.",
+            )
+            # Fall through — let the retry proceed past this guard
+        else:
+            raise HTTPException(status_code=409, detail={
+                "error_code": "AVATAR_ALREADY_GENERATING",
+                "message":    "Your avatar is already being generated. Please wait.",
+            })
+
     # ── Guard: body photo must still exist ────────────────────────────────────
+    # This guard comes AFTER the generating check deliberately. A stale-generating
+    # session may have had its body_photo_path nulled if the server completed
+    # avatar generation but the client never received the response. In that case
+    # avatar_status will be 'ready' (caught by idempotency above) or 'failed' with
+    # the body photo still intact. The only time body_photo_path is None with a
+    # non-ready status is a genuine re-upload requirement.
     body_photo_path = session_row.get("body_photo_path")
     if not body_photo_path:
         raise HTTPException(status_code=422, detail={
             "error_code": "BODY_PHOTO_MISSING",
             "message":    "Body photo not found. Please re-upload your photo.",
-        })
-
-    # ── Guard: don't allow concurrent generation ──────────────────────────────
-    if session_row.get("avatar_status") == AvatarStatus.generating.value:
-        raise HTTPException(status_code=409, detail={
-            "error_code": "AVATAR_ALREADY_GENERATING",
-            "message":    "Your avatar is already being generated. Please wait.",
         })
 
     # ── Download body photo from storage ─────────────────────────────────────

@@ -70,7 +70,7 @@ def create_session(data: SessionCreateRequest) -> SessionResponse:
 
     result = get_supabase().table(TABLE).insert(row).execute()
 
-    if not result.data:
+    if not result or not result.data:
         raise RuntimeError(f"Failed to create session: {result}")
 
     log.info(f"[{session_id}] Session created gender={data.gender} h={data.height_cm} w={data.weight_kg}")
@@ -87,7 +87,7 @@ def get_session(session_id: str) -> Optional[SessionResponse]:
         .maybe_single()
         .execute()
     )
-    if not result.data:
+    if not result or not result.data:
         return None
     return _row_to_response(result.data)
 
@@ -105,6 +105,8 @@ def get_session_raw(session_id: str) -> Optional[dict]:
         .maybe_single()
         .execute()
     )
+    if not result:
+        return None
     return result.data or None
 
 

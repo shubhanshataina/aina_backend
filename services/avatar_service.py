@@ -40,7 +40,7 @@ import json
 import logging
 import threading
 
-import httpx
+import aiohttp
 from fastapi import HTTPException
 
 from config import get_settings
@@ -56,9 +56,9 @@ log = logging.getLogger("app")
 # Update this string when a newer stable model is available in the Model Garden.
 _VERTEX_MODEL = "gemini-2.5-flash-image"
 
-# HTTP timeouts for the legacy Gemini AI Studio path only.
+# Timeout for the legacy Gemini AI Studio path.
 # The Vertex SDK manages its own internal timeouts.
-_GEMINI_TIMEOUT = httpx.Timeout(connect=10.0, read=150.0, write=30.0, pool=5.0)
+_GEMINI_TIMEOUT = aiohttp.ClientTimeout(total=160.0, connect=10.0, sock_read=150.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,9 +519,11 @@ async def _generate_via_gemini(
     url = _GEMINI_ENDPOINT.format(model=_GEMINI_MODEL, key=settings.gemini_api_key)
 
     try:
-        async with httpx.AsyncClient(timeout=_GEMINI_TIMEOUT) as client:
-            response = await client.post(url, json=payload)
-    except httpx.TimeoutException:
+        async with aiohttp.ClientSession(timeout=_GEMINI_TIMEOUT) as client:
+            async with client.post(url, json=payload) as response:
+                response_status = response.status
+                response_text   = await response.text()
+    except aiohttp.ServerTimeoutError:
         raise HTTPException(status_code=504, detail={
             "error_code": "AVATAR_TIMEOUT",
             "message":    "Avatar generation is taking longer than expected. Please try again.",
@@ -533,19 +535,21 @@ async def _generate_via_gemini(
             "message":    "Avatar service is temporarily unavailable. Please try again.",
         })
 
-    if response.status_code != 200:
+    if response_status != 200:
+        import json as _json
         try:
-            msg = response.json().get("error", {}).get("message", "")
+            msg = _json.loads(response_text).get("error", {}).get("message", "")
         except Exception:
-            msg = response.text[:200]
-        log.error(f"[{session_id}] Gemini error {response.status_code}: {msg}")
+            msg = response_text[:200]
+        log.error(f"[{session_id}] Gemini error {response_status}: {msg}")
         raise HTTPException(status_code=500, detail={
             "error_code": "AVATAR_FAILED",
             "message":    "Avatar generation failed. Please try again.",
         })
 
+    import json as _json
     try:
-        data         = response.json()
+        data         = _json.loads(response_text)
         candidates   = data.get("candidates", [])
         parts        = candidates[0].get("content", {}).get("parts", [])
         for part in parts:
