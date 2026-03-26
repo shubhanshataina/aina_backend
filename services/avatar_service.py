@@ -73,6 +73,32 @@ _GEMINI_TIMEOUT = aiohttp.ClientTimeout(total=160.0, connect=10.0, sock_read=150
 _vertex_initialised = False
 _vertex_init_lock   = threading.Lock()
 
+# ── Vertex generation concurrency guard ───────────────────────────────────────
+# Allows only one generate_content() call at a time across all concurrent
+# requests in this process. Vertex AI image generation models have tight
+# per-minute quotas. Two simultaneous requests (e.g. from a frontend retry
+# racing with a still-in-flight first request) both passing the DB-level 409
+# guard and hitting Vertex concurrently causes quota exhaustion (finish_reason=11)
+# on the first call and a hard 429 on the second.
+#
+# asyncio.Semaphore(1) is sufficient because uvicorn runs with workers=1.
+# It is process-local — if you ever move to multiple workers, replace this
+# with a distributed lock (e.g. Supabase advisory lock or Redis SETNX).
+#
+# The semaphore is created lazily on first use (not at import time) because
+# it must be created inside a running event loop.
+_vertex_semaphore: asyncio.Semaphore | None = None
+_vertex_semaphore_lock = threading.Lock()
+
+def _get_vertex_semaphore() -> asyncio.Semaphore:
+    """Return the process-level Vertex generation semaphore, creating it if needed."""
+    global _vertex_semaphore
+    if _vertex_semaphore is None:
+        with _vertex_semaphore_lock:
+            if _vertex_semaphore is None:
+                _vertex_semaphore = asyncio.Semaphore(1)
+    return _vertex_semaphore
+
 
 def _ensure_vertex_initialised() -> None:
     """
@@ -328,11 +354,30 @@ def _call_vertex_sync(
     # constraint and defaulting to text-only output.
     gen_config = GenerationConfig(response_modalities=["IMAGE", "TEXT"])
 
+    # finish_reason int values returned by the Vertex SDK.
+    # The SDK may not recognise newer enum values and falls back to the raw int,
+    # so we check both the .name string and the raw int value.
+    #
+    # 1 = STOP (normal completion)
+    # 2 = MAX_TOKENS
+    # 3 = SAFETY
+    # 8 = BLOCKLIST
+    # 9 = PROHIBITED_CONTENT
+    # 11 = IMAGE_GENERATION_QUOTA_EXCEEDED  ← what we are seeing in logs
+    _QUOTA_FINISH_REASONS     = {"IMAGE_GENERATION_QUOTA_EXCEEDED", "RESOURCE_EXHAUSTED"}
+    _QUOTA_FINISH_REASON_INTS = {11}
+    _SAFETY_FINISH_REASONS    = {"SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT"}
+    _SAFETY_FINISH_REASON_INTS = {3, 8, 9}
+
     def _attempt() -> bytes | None:
         """
         Single generate_content attempt.
-        Returns image bytes if found, None if the response contained only text.
-        Raises _SafetyBlockedError for safety blocks (not retriable).
+        Returns image bytes if found, None if the response contained only text
+        and the finish reason is a transient/retryable model quirk.
+
+        Raises:
+          _SafetyBlockedError  — finish reason is safety/content block (not retriable)
+          _QuotaExceededError  — finish reason is quota exhaustion (not retriable, do not retry)
         """
         response  = model.generate_content(
             [image_part, prompt],
@@ -344,17 +389,32 @@ def _call_vertex_sync(
             if part.inline_data and part.inline_data.data:
                 return part.inline_data.data   # raw bytes, not base64
 
-        # No image found — log what the model returned so we can monitor frequency
-        finish_reason = candidate.finish_reason
-        if hasattr(finish_reason, 'name') and finish_reason.name == "SAFETY":
+        # No image in the response — inspect finish_reason before deciding to retry.
+        finish_reason      = candidate.finish_reason
+        finish_reason_name = getattr(finish_reason, "name", str(finish_reason))
+        finish_reason_int  = finish_reason if isinstance(finish_reason, int) else getattr(finish_reason, "value", None)
+
+        # Quota exhaustion — do NOT retry, raise immediately.
+        # finish_reason=11 (IMAGE_GENERATION_QUOTA_EXCEEDED) means a second call
+        # will also fail and wastes quota budget.
+        if finish_reason_name in _QUOTA_FINISH_REASONS or finish_reason_int in _QUOTA_FINISH_REASON_INTS:
+            log.warning(
+                f"Vertex quota finish reason detected — not retrying. "
+                f"finish_reason={finish_reason_name}({finish_reason_int})"
+            )
+            raise _QuotaExceededError(f"finish_reason={finish_reason_name}")
+
+        # Safety / content block — not retriable.
+        if finish_reason_name in _SAFETY_FINISH_REASONS or finish_reason_int in _SAFETY_FINISH_REASON_INTS:
             raise _SafetyBlockedError()
 
+        # Anything else with no image — log and treat as transiently retryable.
         text_preview = " | ".join(
             p.text[:120] for p in candidate.content.parts if hasattr(p, "text") and p.text
         ) or "<no text>"
         log.warning(
-            f"Vertex returned text-only response (no image part). "
-            f"finish_reason={getattr(finish_reason, 'name', finish_reason)} "
+            f"Vertex returned no image part — will retry once. "
+            f"finish_reason={finish_reason_name}({finish_reason_int}) "
             f"text_preview={text_preview!r}"
         )
         return None
@@ -364,19 +424,28 @@ def _call_vertex_sync(
     if result is not None:
         return result
 
-    # One retry — text-only first response is a transient model quirk
-    log.info("Retrying Vertex generate_content after text-only first response")
+    # One retry — text-only first response on preview models is a known transient quirk.
+    # We only reach here if finish_reason was NOT quota or safety (those raise above).
+    log.info("Retrying Vertex generate_content after no-image first response")
     result = _attempt()
     if result is not None:
         return result
 
-    raise _NoImageError("Both attempts returned text-only response with no image part")
+    raise _NoImageError("Both attempts returned no image part")
 
 
 class _SafetyBlockedError(Exception):
     pass
 
 class _NoImageError(Exception):
+    pass
+
+class _QuotaExceededError(Exception):
+    """
+    Raised when Vertex returns finish_reason=IMAGE_GENERATION_QUOTA_EXCEEDED (11).
+    Caught in _generate_via_vertex and mapped to AVATAR_RATE_LIMITED.
+    Must NOT be retried — the quota is exhausted for this project/period.
+    """
     pass
 
 
@@ -405,11 +474,28 @@ async def _generate_via_vertex(
 
     log.info(f"[{session_id}] Calling Vertex AI SDK — model={_VERTEX_MODEL}")
 
+    semaphore = _get_vertex_semaphore()
+    queue_pos = semaphore._value  # 0 = will queue, 1 = will run immediately
+    if queue_pos == 0:
+        log.info(f"[{session_id}] Vertex semaphore busy — queuing (prevents concurrent quota hit)")
+
     try:
-        avatar_bytes = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: _call_vertex_sync(body_image_bytes, body_image_mime, prompt),
-        )
+        async with semaphore:
+            log.info(f"[{session_id}] Vertex semaphore acquired — starting generate_content()")
+            avatar_bytes = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _call_vertex_sync(body_image_bytes, body_image_mime, prompt),
+            )
+    except _QuotaExceededError as e:
+        # finish_reason=11 — quota exhausted at the model/project level.
+        # Raised from _attempt() without a retry so we don't double-spend quota.
+        # The outer exception handler also catches SDK-level 429s (resource exhausted)
+        # that arrive as gRPC exceptions rather than finish_reason values.
+        log.warning(f"[{session_id}] Vertex quota finish reason: {e}")
+        raise HTTPException(status_code=429, detail={
+            "error_code": "AVATAR_RATE_LIMITED",
+            "message":    "Avatar generation quota reached. Please try again in a few minutes.",
+        })
     except _SafetyBlockedError:
         log.warning(f"[{session_id}] Vertex safety filter blocked avatar generation")
         raise HTTPException(status_code=422, detail={
