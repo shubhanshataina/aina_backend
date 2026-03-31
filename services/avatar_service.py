@@ -252,7 +252,7 @@ def _warmup_grpc_channel() -> None:
 
 _CLOTHING = {
     "male":   "fitted black compression t-shirt and black compression shorts",
-    "female": "fitted black sports bra and black compression leggings",
+    "female": "fitted black bodycon tank yoga jumpsuit",
 }
 
 def _build_prompt(gender: str) -> str:
