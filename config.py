@@ -61,10 +61,15 @@ class Settings(BaseSettings):
     google_credentials_json:  str = Field("", env="GOOGLE_CREDENTIALS_JSON")
 
     # ── Session cookie ────────────────────────────────────────────────────────
-    session_cookie_name:     str  = Field("aina_session", env="SESSION_COOKIE_NAME")
-    session_cookie_max_age:  int  = Field(86400,          env="SESSION_COOKIE_MAX_AGE")
-    session_cookie_secure:   bool = Field(True,           env="SESSION_COOKIE_SECURE")
-    session_cookie_samesite: str  = Field("lax",          env="SESSION_COOKIE_SAMESITE")
+    session_cookie_name:     str       = Field("aina_session",       env="SESSION_COOKIE_NAME")
+    session_cookie_max_age:  int       = Field(86400,                env="SESSION_COOKIE_MAX_AGE")
+    session_cookie_secure:   bool      = Field(True,                 env="SESSION_COOKIE_SECURE")
+    session_cookie_samesite: str       = Field("none",               env="SESSION_COOKIE_SAMESITE")
+    # Domain must start with a leading dot so the cookie is valid on all subdomains.
+    # Example: ".ragerstudios.com" covers both ainaapi.ragerstudios.com (sets it)
+    # and aina3d.ragerstudios.com (reads it).
+    # Leave blank in local dev — the browser binds to localhost automatically.
+    session_cookie_domain:   str | None = Field(None,                env="SESSION_COOKIE_DOMAIN")
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     # In pydantic-settings v2, field names map directly to env var names

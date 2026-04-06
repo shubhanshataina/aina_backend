@@ -157,10 +157,14 @@ def _set_session_cookie(response: Response, session_id: str) -> None:
         key      = settings.session_cookie_name,
         value    = session_id,
         max_age  = settings.session_cookie_max_age,
-        httponly = True,                         # JS cannot read — XSS protection
+        httponly = True,                          # JS cannot read — XSS protection
         secure   = settings.session_cookie_secure,
         samesite = settings.session_cookie_samesite,
         path     = "/",
+        # domain=".ragerstudios.com" makes the cookie valid on all subdomains.
+        # When None (local dev) the browser binds the cookie to the exact host
+        # that set it (localhost) which is correct for development.
+        domain   = settings.session_cookie_domain or None,
     )
 
 
