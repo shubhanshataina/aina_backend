@@ -99,6 +99,25 @@ def _get_vertex_semaphore() -> asyncio.Semaphore:
                 _vertex_semaphore = asyncio.Semaphore(1)
     return _vertex_semaphore
 
+def _bake_orientation(image_bytes: bytes) -> bytes:
+    """
+    Rotate pixel data to match EXIF Orientation tag, then strip all EXIF.
+
+    Vertex AI returns JPEGs with an Orientation tag (commonly value 6 = 90°CW).
+    Chrome and Android apply the tag visually. Safari on iOS does not — it
+    renders raw pixels, making a portrait image appear in landscape.
+
+    PIL's ImageOps.exif_transpose() bakes the rotation into actual pixels
+    and clears the tag so every client sees the same result with no CSS needed.
+    """
+    from PIL import Image, ImageOps
+    import io
+
+    img = Image.open(io.BytesIO(image_bytes))
+    img = ImageOps.exif_transpose(img)   # rotates pixels + clears Orientation tag
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=95)
+    return out.getvalue()
 
 def _ensure_vertex_initialised() -> None:
     """
@@ -485,6 +504,16 @@ async def _generate_via_vertex(
             avatar_bytes = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: _call_vertex_sync(body_image_bytes, body_image_mime, prompt),
+            )
+
+            # ── Fix EXIF orientation (Safari iOS bug) ─────────────────────
+            # Vertex embeds an EXIF Orientation tag. Chrome/Android apply it
+            # visually; Safari renders raw pixels — portrait becomes landscape.
+            # _bake_orientation() rotates pixels to match the tag, then strips
+            # all EXIF so every browser sees identical output.
+            avatar_bytes = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _bake_orientation(avatar_bytes),
             )
     except _QuotaExceededError as e:
         # finish_reason=11 — quota exhausted at the model/project level.
