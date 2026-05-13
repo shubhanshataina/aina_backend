@@ -99,6 +99,36 @@ def _get_vertex_semaphore() -> asyncio.Semaphore:
                 _vertex_semaphore = asyncio.Semaphore(1)
     return _vertex_semaphore
 
+def _normalize_input_image(image_bytes: bytes) -> bytes:
+    """
+    Normalize incoming bytes from mobile clients into a standard RGB JPEG.
+    CRITICAL: Bakes EXIF orientation into the pixels so Vertex AI doesn't 
+    process a 'sideways' raw sensor image from Android/iOS cameras.
+    """
+    from PIL import Image, ImageOps
+    import io
+
+    # Enable HEIC support for native iOS camera uploads
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+    except ImportError:
+        pass 
+
+    img = Image.open(io.BytesIO(image_bytes))
+
+    # 1. FIX: Rotate the actual pixels to match the EXIF tag, then strip the tag.
+    # This guarantees Vertex AI sees an upright person regardless of the device.
+    img = ImageOps.exif_transpose(img)
+
+    # 2. Drop alpha channels and force standard RGB
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=95)
+    return out.getvalue()
+
 def _bake_orientation(image_bytes: bytes) -> bytes:
     """
     Rotate pixel data to match EXIF Orientation tag, then strip all EXIF.
@@ -365,8 +395,11 @@ def _call_vertex_sync(
     """
     from vertexai.generative_models import GenerativeModel, GenerationConfig, Part, Image
 
+    # 1. Normalize the incoming bytes to a safe JPEG format
+    safe_image_bytes = _normalize_input_image(body_image_bytes)
+
     model      = GenerativeModel(_VERTEX_MODEL)
-    image_part = Part.from_image(Image.from_bytes(body_image_bytes))
+    image_part = Part.from_image(Image.from_bytes(safe_image_bytes))
 
     # GenerationConfig object is required — passing a raw dict causes some SDK
     # versions to silently drop unrecognised fields, losing the IMAGE modality
