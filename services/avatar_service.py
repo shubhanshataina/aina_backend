@@ -106,7 +106,7 @@ def _normalize_input_image(image_bytes: bytes) -> bytes:
     process a 'sideways' raw sensor image from Android/iOS cameras.
     """
     from PIL import Image, ImageOps
-    import io
+    import io, gc
 
     # Enable HEIC support for native iOS camera uploads
     try:
@@ -125,9 +125,16 @@ def _normalize_input_image(image_bytes: bytes) -> bytes:
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
 
+    MAX_SIZE = (1024, 1024)
+    img.thumbnail(MAX_SIZE, Image.LANCZOS)
+
     out = io.BytesIO()
-    img.save(out, format="JPEG", quality=95)
-    return out.getvalue()
+    img.save(out, format="JPEG", quality=85)
+    result = out.getvalue()
+    img.close()
+    del img, out
+    gc.collect()
+    return result
 
 def _bake_orientation(image_bytes: bytes) -> bytes:
     """
@@ -141,13 +148,17 @@ def _bake_orientation(image_bytes: bytes) -> bytes:
     and clears the tag so every client sees the same result with no CSS needed.
     """
     from PIL import Image, ImageOps
-    import io
+    import io, gc
 
     img = Image.open(io.BytesIO(image_bytes))
     img = ImageOps.exif_transpose(img)   # rotates pixels + clears Orientation tag
     out = io.BytesIO()
-    img.save(out, format="JPEG", quality=95)
-    return out.getvalue()
+    img.save(out, format="JPEG", quality=85)
+    result = out.getvalue()
+    img.close()
+    del img, out
+    gc.collect()
+    return result
 
 def _ensure_vertex_initialised() -> None:
     """
@@ -393,13 +404,19 @@ def _call_vertex_sync(
     the second call consistently returns the image. The retry is handled here,
     inside the sync function, so the async caller never needs to know about it.
     """
+    import gc
     from vertexai.generative_models import GenerativeModel, GenerationConfig, Part, Image
 
     # 1. Normalize the incoming bytes to a safe JPEG format
     safe_image_bytes = _normalize_input_image(body_image_bytes)
+    del body_image_bytes
+    gc.collect()
 
     model      = GenerativeModel(_VERTEX_MODEL)
     image_part = Part.from_image(Image.from_bytes(safe_image_bytes))
+    
+    del safe_image_bytes
+    gc.collect()
 
     # GenerationConfig object is required — passing a raw dict causes some SDK
     # versions to silently drop unrecognised fields, losing the IMAGE modality
